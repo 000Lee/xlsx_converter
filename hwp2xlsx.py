@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-HWP 5.0(.hwp) 표 -> XLSX 일괄 변환
+한글 문서(.hwp / .hwpx) 표 -> XLSX 일괄 변환
 
-한/글 · 엑셀 설치 불필요. .hwp 바이너리(OLE 복합문서)를 직접 파싱해서
-병합 / 테두리 / 배경색 / 글꼴 / 글자색 / 굵기 / 취소선 / 열너비 / 행높이를
+한/글 · 엑셀 설치 불필요. 파일 내부를 직접 파싱해서 병합 / 테두리 /
+배경색 / 글꼴 / 글자색 / 굵기 / 취소선 / 형광펜 / 열너비 / 행높이를
 그대로 옮긴다.
+
+.hwp 는 OLE 복합문서(바이너리), .hwpx 는 ZIP 안의 XML(OWPML)로 구조가
+전혀 다르다. 확장자가 아니라 파일 앞 4바이트로 판별해서 각각 읽은 뒤,
+같은 형태로 정규화해서 엑셀 쓰기 부분을 공유한다.
 
 쓰기는 xlsxwriter 를 쓴다. openpyxl 은 문자열을 무조건 t="inlineStr" 로만
 저장하는데(cell/_writer.py), 엑셀은 인라인 문자열 안의 리치텍스트 런을
@@ -16,10 +20,12 @@ sharedStrings 에 제대로 기록하는 xlsxwriter 로 써야 한다.
 """
 
 import os
+import re
 import sys
 import glob
 import struct
 import zlib
+import zipfile
 import traceback
 
 import olefile
@@ -34,9 +40,10 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 # ============================ 설정 ============================
-# 비워두면 이 스크립트(또는 exe)가 있는 폴더에서 .hwp 를 찾는다.
+# 비워두면 이 스크립트(또는 exe)가 있는 폴더에서 .hwp / .hwpx 를 찾는다.
 IN_DIR = r""
-# 비워두면 입력 폴더 아래 xlsx 폴더에 저장한다.
+# 비워두면 "바탕화면\시간표_엑셀변환\<원본폴더이름>" 에 저장한다.
+# 공유폴더에서 돌려도 결과물은 항상 실행한 사람 PC 에 쌓인다.
 OUT_DIR = r""
 
 # 한/글 전용 글꼴을 PC에 있는 글꼴로 바꾸고 싶을 때만 사용 (비워두면 원본 글꼴명 유지)
@@ -105,8 +112,12 @@ def _font_name(n):
 
 # --------------------------- DocInfo ---------------------------
 def parse_docinfo(buf):
-    """글꼴 / 테두리채우기 / 글자모양 / 문단모양 목록"""
-    faces, borderfills, charshapes, parashapes = [], [], [], []
+    """글꼴 / 테두리채우기 / 글자모양 / 문단모양 -> 참조 ID 로 찾는 dict
+
+    HWPX 파서(parse_hwpx)와 같은 형태를 내놓아서 이후 처리를 공유한다.
+    테두리는 여기서 이미 (엑셀 테두리코드, 색) 로 변환해 둔다.
+    """
+    faces, borderfills, charshapes, parashapes = [], {}, {}, {}
     for tag, lvl, d in _records(buf):
         if tag == 19 and len(d) >= 3:                       # FACE_NAME
             ln = struct.unpack('<H', d[1:3])[0]
@@ -115,8 +126,8 @@ def parse_docinfo(buf):
         elif tag == 20 and len(d) >= 32:                    # BORDER_FILL
             b = {}
             for k, off in (('l', 2), ('r', 8), ('t', 14), ('b', 20)):
-                b[k] = (d[off], d[off + 1],
-                        struct.unpack('<I', d[off + 2:off + 6])[0])
+                b[k] = _side(d[off], d[off + 1],
+                             struct.unpack('<I', d[off + 2:off + 6])[0])
             fill = None
             if len(d) >= 36:
                 ft = struct.unpack('<I', d[32:36])[0]
@@ -126,12 +137,12 @@ def parse_docinfo(buf):
                     if ptype < 0:                           # 무늬 없음 = 단색
                         fill = _rgb(back)
             b['fill'] = fill
-            borderfills.append(b)
+            borderfills[len(borderfills) + 1] = b           # 셀은 1부터 참조
 
         elif tag == 21 and len(d) >= 56:                    # CHAR_SHAPE
             prop = struct.unpack('<I', d[46:50])[0]
-            charshapes.append(dict(
-                face=struct.unpack('<H', d[0:2])[0],
+            charshapes[len(charshapes)] = dict(
+                face=struct.unpack('<H', d[0:2])[0],        # 아래에서 이름으로 치환
                 size=struct.unpack('<i', d[42:46])[0] / 100.0,
                 italic=bool(prop & 1),
                 bold=bool((prop >> 1) & 1),
@@ -139,12 +150,230 @@ def parse_docinfo(buf):
                 # 취소선 글자모양에서 함께 세팅되므로 아래쪽만 인정한다.
                 underline=(((prop >> 2) & 3) == 1),
                 strike=bool((prop >> 18) & 7),
-                color=_rgb(struct.unpack('<I', d[52:56])[0]) or '000000'))
+                color=_rgb(struct.unpack('<I', d[52:56])[0]) or '000000')
 
         elif tag == 25 and len(d) >= 4:                     # PARA_SHAPE
-            parashapes.append((struct.unpack('<I', d[0:4])[0] >> 2) & 7)
+            parashapes[len(parashapes)] = (struct.unpack('<I', d[0:4])[0] >> 2) & 7
 
-    return faces, borderfills, charshapes, parashapes
+    for cs in charshapes.values():                          # 글꼴 번호 -> 이름
+        i = cs['face']
+        cs['font'] = faces[i] if i < len(faces) else None
+
+    return borderfills, charshapes, parashapes
+
+
+# ---------------------------- HWPX ----------------------------
+# .hwpx 는 ZIP 안에 XML 이 든 개방형 포맷(OWPML)이다. 바이트 위치가 아니라
+# 태그 이름으로 읽으므로 .hwp 바이너리보다 해석이 명확하다.
+_HWPX_ALIGN = {'JUSTIFY': 0, 'LEFT': 1, 'RIGHT': 2, 'CENTER': 3,
+               'DISTRIBUTE': 4, 'DISTRIBUTE_SPACE': 5}
+_HWPX_VALIGN = {'TOP': 0, 'CENTER': 1, 'BOTTOM': 2}
+
+
+def _mm(s):
+    """'0.5 mm' -> 0.5"""
+    try:
+        return float(str(s).replace('mm', '').strip())
+    except ValueError:
+        return 0.5
+
+
+def _side_hwpx(el):
+    """<hh:leftBorder type=".." width="0.5 mm" color="#000000"/> -> Side"""
+    if el is None:
+        return 0, None
+    t = (el.get('type') or 'NONE').upper()
+    if t in ('NONE', ''):
+        return 0, None
+    mm = _mm(el.get('width'))
+    if 'DASH_DOT_DOT' in t:
+        style = 12 if mm >= 0.4 else 11
+    elif 'DASH_DOT' in t:
+        style = 10 if mm >= 0.4 else 9
+    elif 'DOT' in t:
+        style = 4
+    elif 'DASH' in t:
+        style = 8 if mm >= 0.4 else 3
+    elif 'DOUBLE' in t or 'THICK' in t and 'SLIM' in t:
+        style = 6
+    else:                                       # SOLID 등
+        style = 5 if mm >= 0.7 else (2 if mm >= 0.4 else 1)
+    c = el.get('color') or '#000000'
+    return style, (c if c.startswith('#') else '#' + c)
+
+
+def _q(tag):
+    """네임스페이스를 무시하고 지역 이름만 비교하기 위한 헬퍼"""
+    return tag.rsplit('}', 1)[-1]
+
+
+def _find(el, name):
+    for c in el.iter():
+        if _q(c.tag) == name:
+            return c
+    return None
+
+
+def parse_hwpx_header(root):
+    """header.xml -> (테두리채우기, 글자모양, 문단모양)  ID 로 찾는 dict"""
+    fonts = {}                                   # (언어, id) -> 글꼴 이름
+    for ff in root.iter():
+        if _q(ff.tag) != 'fontface':
+            continue
+        lang = ff.get('lang') or ''
+        for fo in ff:
+            if _q(fo.tag) == 'font':
+                fonts[(lang, fo.get('id'))] = fo.get('face')
+
+    borderfills, charshapes, parashapes = {}, {}, {}
+    for el in root.iter():
+        name = _q(el.tag)
+
+        if name == 'borderFill':
+            b = {}
+            for key, tag in (('l', 'leftBorder'), ('r', 'rightBorder'),
+                             ('t', 'topBorder'), ('b', 'bottomBorder')):
+                b[key] = _side_hwpx(_find(el, tag))
+            fill = None
+            brush = _find(el, 'winBrush')
+            if brush is not None:
+                fc = brush.get('faceColor')
+                if fc and fc.lower() not in ('none', ''):
+                    fill = fc.lstrip('#').upper()
+            b['fill'] = fill
+            borderfills[el.get('id')] = b
+
+        elif name == 'charPr':
+            ul = _find(el, 'underline')
+            so = _find(el, 'strikeout')
+            ref = _find(el, 'fontRef')
+            font = None
+            if ref is not None:
+                font = fonts.get(('HANGUL', ref.get('hangul'))) \
+                    or fonts.get(('LATIN', ref.get('latin')))
+            color = (el.get('textColor') or '#000000').lstrip('#').upper()
+            charshapes[el.get('id')] = dict(
+                font=font,
+                size=float(el.get('height') or 1000) / 100.0,
+                bold=_find(el, 'bold') is not None,
+                italic=_find(el, 'italic') is not None,
+                # underline 은 type 이 NONE 이 아닐 때만 밑줄
+                underline=bool(ul is not None
+                               and (ul.get('type') or 'NONE').upper() not in ('NONE', '')),
+                # strikeout 은 shape 이 실제 선 모양일 때만 취소선.
+                # NONE 은 물론이고 3D 도 '긋지 않음'으로 저장되어 있다.
+                strike=bool(so is not None
+                            and (so.get('shape') or 'NONE').upper() not in ('NONE', '', '3D')),
+                color=color if len(color) == 6 else '000000')
+
+        elif name == 'paraPr':
+            al = _find(el, 'align')
+            parashapes[el.get('id')] = _HWPX_ALIGN.get(
+                (al.get('horizontal') or '').upper() if al is not None else '', 0)
+
+    return borderfills, charshapes, parashapes
+
+
+def _run_text(r):
+    """<hp:run> 안의 글자와 형광펜 색을 뽑는다.
+
+    <hp:t> 안에 형광펜(markpen) 같은 표식이 들어가면 실제 글자가
+    <hp:t>.text 가 아니라 그 표식의 tail 에 놓인다. 그래서 하위 노드를
+    전부 훑으면서 text 와 tail 을 순서대로 모아야 글자가 누락되지 않는다.
+    """
+    out, state = [], {'hl': None}
+
+    def walk(el):
+        n = _q(el.tag)
+        if n == 'markpenBegin':
+            state['hl'] = el.get('color') or state['hl']
+        elif n == 'lineBreak':
+            out.append('\n')
+        if el.text:
+            out.append(el.text)
+        for ch in el:
+            walk(ch)
+            if ch.tail:
+                out.append(ch.tail)
+
+    for t in r:
+        if _q(t.tag) == 't':
+            walk(t)
+    return ''.join(out), state['hl']
+
+
+def parse_hwpx_section(root, warn):
+    """section*.xml -> [(표정보, 셀목록), ...]"""
+    tables = []
+    for tbl in root.iter():
+        if _q(tbl.tag) != 'tbl':
+            continue
+        cells = []
+        for tc in tbl.iter():
+            if _q(tc.tag) != 'tc':
+                continue
+            addr = _find(tc, 'cellAddr')
+            span = _find(tc, 'cellSpan')
+            size = _find(tc, 'cellSz')
+            sub = _find(tc, 'subList')
+            if addr is None:
+                continue
+
+            paras, hl = [], None
+            for p in tc.iter():
+                if _q(p.tag) != 'p':
+                    continue
+                runs = []
+                for r in p:
+                    if _q(r.tag) != 'run':
+                        continue
+                    s, c = _run_text(r)
+                    hl = hl or c
+                    if s:
+                        runs.append((r.get('charPrIDRef'), s))
+                paras.append(dict(shape=p.get('paraPrIDRef'), runs=runs))
+
+            cells.append(dict(
+                col=int(addr.get('colAddr') or 0),
+                row=int(addr.get('rowAddr') or 0),
+                cspan=int(span.get('colSpan') or 1) if span is not None else 1,
+                rspan=int(span.get('rowSpan') or 1) if span is not None else 1,
+                w=int(size.get('width') or 0) if size is not None else 0,
+                h=int(size.get('height') or 0) if size is not None else 0,
+                bf=tc.get('borderFillIDRef'),
+                valign=_HWPX_VALIGN.get(
+                    (sub.get('vertAlign') or '').upper() if sub is not None else '', 1),
+                hl=(hl.lstrip('#').upper() if hl else None),
+                paras=paras))
+
+        if cells:
+            tables.append((dict(rows=int(tbl.get('rowCnt') or 0),
+                                cols=int(tbl.get('colCnt') or 0)), cells))
+    return tables
+
+
+def read_hwpx(path, warn):
+    """.hwpx -> (테두리채우기, 글자모양, 문단모양, 표목록)"""
+    import xml.etree.ElementTree as ET
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        hdr = next((n for n in names if n.lower().endswith('header.xml')), None)
+        if hdr is None:
+            raise ValueError('header.xml 이 없음 - HWPX 가 아닌 것 같음')
+        bfs, css, pss = parse_hwpx_header(ET.fromstring(z.read(hdr)))
+
+        secs = sorted(n for n in names
+                      if re.match(r'Contents/section\d+\.xml$', n, re.I))
+        tables = []
+        for s in secs:
+            root = ET.fromstring(z.read(s))
+            n_shape = sum(1 for e in root.iter()
+                          if _q(e.tag) in ('rect', 'ellipse', 'polygon', 'pic', 'container'))
+            if n_shape:
+                warn.append('그리기개체/글상자 %d개 감지 - 개체 안의 표는 누락될 수 있음'
+                            % n_shape)
+            tables.extend(parse_hwpx_section(root, warn))
+    return bfs, css, pss, tables
 
 
 # ------------------------- 문단 텍스트 -------------------------
@@ -225,8 +454,24 @@ def parse_tables(buf, warn):
         if deep_cell:
             warn.append('중첩된 표 발견 - 안쪽 표 내용은 옮기지 않음')
         if cells:
+            for c in cells:                       # HWPX 와 같은 형태로 정규화
+                c['paras'] = [dict(shape=p['shape'], runs=_resolve_runs(p))
+                              for p in c['paras']]
             tables.append((dict(rows=nrows, cols=ncols), cells))
     return tables
+
+
+def _resolve_runs(p):
+    """PARA_CHAR_SHAPE 의 (시작위치, 글자모양ID) 목록 -> [(글자모양ID, 글자)]"""
+    t, pos = p['text'], p['pos']
+    runs = p['runs'] or [(0, 0)]
+    out = []
+    for k, (start, csid) in enumerate(runs):
+        end = runs[k + 1][0] if k + 1 < len(runs) else 1 << 30
+        seg = ''.join(ch for ch, wp in zip(t, pos) if start <= wp < end)
+        if seg:
+            out.append((csid, seg))
+    return out
 
 
 # ------------------------- 시트에 쓰기 -------------------------
@@ -241,15 +486,15 @@ def _fkey(cs):
     """글자모양 비교용 키 (같은 서식이면 같은 값)"""
     if cs is None:
         return None
-    return (cs['face'], cs['size'], cs['bold'], cs['italic'],
+    return (cs['font'], cs['size'], cs['bold'], cs['italic'],
             cs['underline'], cs['strike'], cs['color'])
 
 
-def _font_props(cs, faces):
+def _font_props(cs):
     """글자모양 -> xlsxwriter 글꼴 속성 (리치텍스트 런에 쓰는 부분)"""
     p = {'font_size': cs['size'], 'font_color': '#' + cs['color']}
-    if cs['face'] < len(faces):
-        p['font_name'] = _font_name(faces[cs['face']])
+    if cs['font']:
+        p['font_name'] = _font_name(cs['font'])
     if cs['bold']:
         p['bold'] = True
     if cs['italic']:
@@ -270,28 +515,31 @@ def _fmt(wb, cache, props):
     return f
 
 
-def _cell_props(bf, align, valign):
+def _cell_props(bf, align, valign, hl=None):
     """셀 단위 서식: 테두리 / 배경 / 정렬"""
     p = {'text_wrap': True,
          'align': _HALIGN[align] if align is not None and align < 6 else 'center',
          'valign': _VALIGN[valign]}
     if bf:
         for key, side in (('left', 'l'), ('right', 'r'), ('top', 't'), ('bottom', 'b')):
-            style, color = _side(*bf[side])
+            style, color = bf[side]            # 파서에서 이미 변환해 둔 값
             if style:
                 p[key] = style
                 p[key + '_color'] = color
         if bf['fill'] and bf['fill'] != 'FFFFFF':
             p['bg_color'] = '#' + bf['fill']
+    # 형광펜은 엑셀에 글자 단위로 없다. 셀 배경색으로 대신 칠한다.
+    if hl and hl != 'FFFFFF':
+        p['bg_color'] = '#' + hl
     return p
 
 
-def write_table(wb, ws, cells, faces, bfs, css, pss, cache):
+def write_table(wb, ws, cells, bfs, css, pss, cache):
     colw, rowh = {}, {}
 
     for c in cells:
         r0, c0 = c['row'], c['col']            # xlsxwriter 는 0부터
-        bf = bfs[c['bf'] - 1] if 0 < c['bf'] <= len(bfs) else None   # ID 는 1부터
+        bf = bfs.get(c['bf'])
 
         if c['cspan'] == 1:
             colw[c0] = max(colw.get(c0, 0), c['w'])
@@ -304,34 +552,29 @@ def write_table(wb, ws, cells, faces, bfs, css, pss, cache):
         # 앞 조각 끝에 붙여서 공백뿐인 런이 생기지 않게 한다.
         segs, align, pending = [], None, ''
         for pi, p in enumerate(c['paras']):
-            t = p['text']
             if pi:
                 if segs:
                     segs[-1][1] += '\n'
                 else:
                     pending += '\n'
-            if align is None and p['shape'] < len(pss):
-                align = pss[p['shape']]
-            runs = p['runs'] or [(0, 0)]
-            for k, (start, csid) in enumerate(runs):
-                end = runs[k + 1][0] if k + 1 < len(runs) else 1 << 30
-                seg = ''.join(ch for ch, wp in zip(t, p['pos'])
-                              if start <= wp < end)
+            if align is None:
+                align = pss.get(p['shape'])
+            for csid, seg in p['runs']:
                 if not seg:
                     continue
-                segs.append([css[csid] if csid < len(css) else None, pending + seg])
+                segs.append([css.get(csid), pending + seg])
                 pending = ''
         if pending and segs:
             segs[-1][1] += pending
 
         text = ''.join(s for _, s in segs)
-        base = _cell_props(bf, align, c['valign'])
+        base = _cell_props(bf, align, c['valign'], c.get('hl'))
         mixed = len({_fkey(cs) for cs, _ in segs}) > 1
 
         # 서식이 하나뿐이면 그 글꼴을 셀 서식에 합친다.
         # 섞였으면 셀 서식의 글꼴은 건드리지 않고(중립) 런별로 지정한다.
         if segs and not mixed and segs[0][0]:
-            base.update(_font_props(segs[0][0], faces))
+            base.update(_font_props(segs[0][0]))
         cell_fmt = _fmt(wb, cache, base)
 
         r1, c1 = r0 + c['rspan'] - 1, c0 + c['cspan'] - 1
@@ -345,7 +588,7 @@ def write_table(wb, ws, cells, faces, bfs, css, pss, cache):
         elif mixed:
             frags = []
             for cs, s in segs:
-                frags.append(_fmt(wb, cache, _font_props(cs, faces)) if cs else None)
+                frags.append(_fmt(wb, cache, _font_props(cs)) if cs else None)
                 frags.append(s)
             frags = [x for x in frags if x is not None]
             ws.write_rich_string(r0, c0, *frags, cell_fmt)
@@ -368,8 +611,8 @@ def write_table(wb, ws, cells, faces, bfs, css, pss, cache):
 
 
 # --------------------------- 변환 1건 ---------------------------
-def convert(src, dst):
-    warn = []
+def read_hwp5(src, warn):
+    """.hwp (OLE 바이너리) -> (테두리채우기, 글자모양, 문단모양, 표목록)"""
     ole = olefile.OleFileIO(src)
     try:
         hdr = ole.openstream('FileHeader').read()
@@ -386,7 +629,7 @@ def convert(src, dst):
             b = ole.openstream(name).read()
             return zlib.decompress(b, -15) if compressed else b
 
-        faces, bfs, css, pss = parse_docinfo(raw('DocInfo'))
+        bfs, css, pss = parse_docinfo(raw('DocInfo'))
         sections = sorted(s for s in ('/'.join(x) for x in ole.listdir())
                           if s.startswith('BodyText/Section'))
         tables = []
@@ -394,6 +637,21 @@ def convert(src, dst):
             tables.extend(parse_tables(raw(s), warn))
     finally:
         ole.close()
+    return bfs, css, pss, tables
+
+
+def convert(src, dst):
+    warn = []
+    with open(src, 'rb') as fp:
+        magic = fp.read(8)
+
+    # 확장자가 아니라 실제 내용으로 판별한다 (확장자만 바꿔둔 파일 대비).
+    if magic[:4] == b'PK\x03\x04':                        # ZIP -> HWPX
+        bfs, css, pss, tables = read_hwpx(src, warn)
+    elif magic == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':    # OLE -> HWP 5.0
+        bfs, css, pss, tables = read_hwp5(src, warn)
+    else:
+        raise ValueError('한글 문서가 아님 (.hwp/.hwpx 둘 다 아님)')
 
     if not tables:
         raise ValueError('표를 찾지 못함')
@@ -407,7 +665,7 @@ def convert(src, dst):
         cache = {}
         for i, (info, cells) in enumerate(tables, 1):
             ws = wb.add_worksheet('표%d' % i if len(tables) > 1 else '표')
-            write_table(wb, ws, cells, faces, bfs, css, pss, cache)
+            write_table(wb, ws, cells, bfs, css, pss, cache)
     finally:
         wb.close()
 
@@ -469,14 +727,54 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
 
 
+OUT_FOLDER_NAME = '시간표_엑셀변환'
+
+
+def _my_dir():
+    """내 PC 의 바탕화면(없으면 문서) 경로.
+
+    공유폴더에 결과를 쓰면 권한이 없어 실패하거나 남의 폴더를 어지럽히므로
+    결과물은 항상 실행한 사람 PC 에 저장한다. OneDrive 로 옮겨진 바탕화면도
+    잡히도록 레지스트리에 등록된 실제 경로를 먼저 본다.
+    """
+    try:
+        import winreg
+        key = r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            for name in ('Desktop', 'Personal'):     # Personal = 내 문서
+                try:
+                    p = os.path.expandvars(winreg.QueryValueEx(k, name)[0])
+                    if os.path.isdir(p):
+                        return p
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    home = os.path.expanduser('~')
+    for p in (os.path.join(home, 'Desktop'), os.path.join(home, 'Documents'), home):
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _out_dir_for(src_dir):
+    """결과물을 저장할 폴더. 바탕화면\\시간표_엑셀변환\\<원본폴더이름>"""
+    root = _my_dir()
+    if not root:
+        return os.path.join(src_dir, 'xlsx')         # 최후 수단
+    name = os.path.basename(os.path.normpath(src_dir)) or '변환결과'
+    return os.path.join(root, OUT_FOLDER_NAME, name)
+
+
 def _collect(paths):
     """파일/폴더 경로 목록 -> .hwp 파일 목록"""
     files = []
     for pth in paths:
         pth = pth.rstrip('"')
         if os.path.isdir(pth):
-            files += glob.glob(os.path.join(pth, '*.hwp'))
-        elif pth.lower().endswith('.hwp'):
+            for ext in ('*.hwp', '*.hwpx'):
+                files += glob.glob(os.path.join(pth, ext))
+        elif pth.lower().endswith(('.hwp', '.hwpx')):
             files.append(pth)
     return sorted(f for f in files if not os.path.basename(f).startswith('~'))
 
@@ -492,11 +790,11 @@ def main():
     elif args:
         files = _collect(args)
         src_dir = os.path.dirname(os.path.abspath(files[0])) if files else ''
-        out_dir = (OUT_DIR or os.path.join(src_dir, 'xlsx')) if files else ''
+        out_dir = (OUT_DIR or _out_dir_for(src_dir)) if files else ''
     else:
         src_dir = _base_dir()
         files = _collect([src_dir])
-        out_dir = OUT_DIR or os.path.join(src_dir, 'xlsx')
+        out_dir = OUT_DIR or _out_dir_for(src_dir)
 
     if not files:
         log('[!] 변환할 .hwp 파일이 없습니다.')
