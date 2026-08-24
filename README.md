@@ -183,6 +183,3 @@ xlsxwriter 는 `sharedStrings.xml` 에 제대로 기록합니다. 이건 엑셀�
 - 열너비: 픽셀 = HWPUNIT / 7200 × 96, 저장값 = (픽셀 − 5) / 7
   - xlsxwriter 는 넘긴 값에 5/7 을 더해서 저장하므로 미리 빼줘야 함
 
-## 라이선스
-
-MIT
