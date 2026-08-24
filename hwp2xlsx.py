@@ -531,7 +531,7 @@ def _cell_props(bf, align, valign):
 
 
 def write_table(wb, ws, cells, bfs, css, pss, cache):
-    colw, rowh = {}, {}
+    colw, rowh, spans = {}, {}, []
 
     for c in cells:
         r0, c0 = c['row'], c['col']            # xlsxwriter 는 0부터
@@ -539,6 +539,8 @@ def write_table(wb, ws, cells, bfs, css, pss, cache):
 
         if c['cspan'] == 1:
             colw[c0] = max(colw.get(c0, 0), c['w'])
+        else:
+            spans.append((c0, c['cspan'], c['w']))
         if c['rspan'] == 1:
             rowh[r0] = max(rowh.get(r0, 0), c['h'])
 
@@ -590,6 +592,21 @@ def write_table(wb, ws, cells, bfs, css, pss, cache):
             ws.write_rich_string(r0, c0, *frags, cell_fmt)
         else:
             ws.write_string(r0, c0, text, cell_fmt)
+
+    # 어떤 열은 그 열을 홑겹으로 쓰는 셀이 하나도 없어서(전부 병합 셀에만
+    # 걸쳐 있어서) 위에서 너비를 못 정한다. 그대로 두면 엑셀 기본값(8.43)이
+    # 되어 그 열만 두 배로 벌어진다. 병합 셀 너비에서 이미 아는 열을 빼고
+    # 남은 폭을 모르는 열끼리 나눠 갖게 한다. 좁은 span 부터 처리해야
+    # 미지 열이 하나만 남는 경우가 많아 정확해진다.
+    for c0, cspan, w in sorted(spans, key=lambda x: x[1]):
+        cols = range(c0, c0 + cspan)
+        unknown = [i for i in cols if i not in colw]
+        if not unknown:
+            continue
+        rest = w - sum(colw.get(i, 0) for i in cols if i in colw)
+        each = max(1, rest // len(unknown))
+        for i in unknown:
+            colw[i] = each
 
     # HWPUNIT = 1/7200 inch
     for ci, w in colw.items():
