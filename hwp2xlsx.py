@@ -3,8 +3,12 @@
 한글 문서(.hwp / .hwpx) 표 -> XLSX 일괄 변환
 
 한/글 · 엑셀 설치 불필요. 파일 내부를 직접 파싱해서 병합 / 테두리 /
-배경색 / 글꼴 / 글자색 / 굵기 / 취소선 / 형광펜 / 열너비 / 행높이를
-그대로 옮긴다.
+배경색 / 글꼴 / 글자색 / 굵기 / 취소선 / 열너비 / 행높이를 그대로 옮긴다.
+
+형광펜은 옮기지 않는다. 엑셀에는 글자 단위 형광펜이 없어서 칸 전체를
+칠할 수밖에 없는데, 실제 문서는 칸 안의 일부 글자(취소된 이름)에만
+형광펜을 치므로 칸을 칠하면 범위를 틀리게 표시하게 된다. 형광펜이 걸린
+글자에는 취소선도 함께 걸려 있어 정보 손실도 사실상 없다.
 
 .hwp 는 OLE 복합문서(바이너리), .hwpx 는 ZIP 안의 XML(OWPML)로 구조가
 전혀 다르다. 확장자가 아니라 파일 앞 4바이트로 판별해서 각각 읽은 뒤,
@@ -275,19 +279,16 @@ def parse_hwpx_header(root):
 
 
 def _run_text(r):
-    """<hp:run> 안의 글자와 형광펜 색을 뽑는다.
+    """<hp:run> 안의 글자를 뽑는다.
 
     <hp:t> 안에 형광펜(markpen) 같은 표식이 들어가면 실제 글자가
     <hp:t>.text 가 아니라 그 표식의 tail 에 놓인다. 그래서 하위 노드를
     전부 훑으면서 text 와 tail 을 순서대로 모아야 글자가 누락되지 않는다.
     """
-    out, state = [], {'hl': None}
+    out = []
 
     def walk(el):
-        n = _q(el.tag)
-        if n == 'markpenBegin':
-            state['hl'] = el.get('color') or state['hl']
-        elif n == 'lineBreak':
+        if _q(el.tag) == 'lineBreak':
             out.append('\n')
         if el.text:
             out.append(el.text)
@@ -299,7 +300,7 @@ def _run_text(r):
     for t in r:
         if _q(t.tag) == 't':
             walk(t)
-    return ''.join(out), state['hl']
+    return ''.join(out)
 
 
 def parse_hwpx_section(root, warn):
@@ -319,7 +320,7 @@ def parse_hwpx_section(root, warn):
             if addr is None:
                 continue
 
-            paras, hl = [], None
+            paras = []
             for p in tc.iter():
                 if _q(p.tag) != 'p':
                     continue
@@ -327,10 +328,9 @@ def parse_hwpx_section(root, warn):
                 for r in p:
                     if _q(r.tag) != 'run':
                         continue
-                    s, c = _run_text(r)
-                    hl = hl or c
-                    if s:
-                        runs.append((r.get('charPrIDRef'), s))
+                    txt = _run_text(r)
+                    if txt:
+                        runs.append((r.get('charPrIDRef'), txt))
                 paras.append(dict(shape=p.get('paraPrIDRef'), runs=runs))
 
             cells.append(dict(
@@ -343,7 +343,6 @@ def parse_hwpx_section(root, warn):
                 bf=tc.get('borderFillIDRef'),
                 valign=_HWPX_VALIGN.get(
                     (sub.get('vertAlign') or '').upper() if sub is not None else '', 1),
-                hl=(hl.lstrip('#').upper() if hl else None),
                 paras=paras))
 
         if cells:
@@ -515,7 +514,7 @@ def _fmt(wb, cache, props):
     return f
 
 
-def _cell_props(bf, align, valign, hl=None):
+def _cell_props(bf, align, valign):
     """셀 단위 서식: 테두리 / 배경 / 정렬"""
     p = {'text_wrap': True,
          'align': _HALIGN[align] if align is not None and align < 6 else 'center',
@@ -528,9 +527,6 @@ def _cell_props(bf, align, valign, hl=None):
                 p[key + '_color'] = color
         if bf['fill'] and bf['fill'] != 'FFFFFF':
             p['bg_color'] = '#' + bf['fill']
-    # 형광펜은 엑셀에 글자 단위로 없다. 셀 배경색으로 대신 칠한다.
-    if hl and hl != 'FFFFFF':
-        p['bg_color'] = '#' + hl
     return p
 
 
@@ -568,7 +564,7 @@ def write_table(wb, ws, cells, bfs, css, pss, cache):
             segs[-1][1] += pending
 
         text = ''.join(s for _, s in segs)
-        base = _cell_props(bf, align, c['valign'], c.get('hl'))
+        base = _cell_props(bf, align, c['valign'])
         mixed = len({_fkey(cs) for cs, _ in segs}) > 1
 
         # 서식이 하나뿐이면 그 글꼴을 셀 서식에 합친다.
