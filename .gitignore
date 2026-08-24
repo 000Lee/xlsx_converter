@@ -1,0 +1,16 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 실행 산출물 / 로그
+xlsx/
+변환로그.txt
+*.xlsx
+*.hwp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

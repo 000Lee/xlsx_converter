@@ -1,0 +1,58 @@
+name: build-exe
+
+on:
+  push:
+    tags: ['v*']          # v1.0 같은 태그를 올리면 Release 를 만들고 exe 를 첨부
+  workflow_dispatch: {}    # Actions 탭에서 수동 실행 (태그 없이 빌드만)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: exe 빌드
+        run: >
+          pyinstaller --onefile --console --name hwp2xlsx
+          --exclude-module numpy --exclude-module pandas
+          --exclude-module matplotlib --exclude-module scipy
+          --exclude-module PIL --exclude-module tkinter
+          --exclude-module openpyxl --exclude-module PyQt5
+          --exclude-module IPython
+          hwp2xlsx.py
+
+      - name: 스모크 테스트 (실행되는지만 확인)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          dist\hwp2xlsx.exe
+          $code = $LASTEXITCODE
+          if ($code -ne 1) { throw "hwp 없을 때 종료코드 1 이어야 함 (실제: $code)" }
+          if (-not (Test-Path dist\변환로그.txt)) { throw "로그 파일이 생성되지 않음" }
+          Write-Host "OK - exe 정상 실행 및 로그 생성 확인"
+          exit 0
+
+      - name: 빌드 결과 업로드 (수동 실행용)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwp2xlsx-exe
+          path: dist/hwp2xlsx.exe
+
+      - name: Release 에 첨부 (태그 push 시에만)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/hwp2xlsx.exe
+          generate_release_notes: true
