@@ -304,11 +304,37 @@ def _run_text(r):
 
 
 def parse_hwpx_section(root, warn):
-    """section*.xml -> [(표정보, 셀목록), ...]"""
-    tables = []
-    for tbl in root.iter():
-        if _q(tbl.tag) != 'tbl':
+    """section*.xml -> 문서 순서대로 블록 목록
+
+    ('tbl', 표정보, 셀목록) 또는 ('p', 문단런목록)
+    표 바깥 문단도 담는다. 예전에는 표만 옮기고 바깥 글을 조용히 버렸다.
+    """
+    blocks = []
+    for p in root:                                   # 섹션 바로 아래 문단들
+        if _q(p.tag) != 'p':
             continue
+        tbls = [e for e in p.iter() if _q(e.tag) == 'tbl']
+        if tbls:
+            for t in tbls:
+                b = _hwpx_table(t)
+                if b:
+                    blocks.append(b)
+            continue
+        runs = []
+        for r in p.iter():
+            if _q(r.tag) != 'run':
+                continue
+            txt = _run_text(r)
+            if txt:
+                runs.append((r.get('charPrIDRef'), txt))
+        # 글자가 없어도 담는다. 한글에서 엔터로 띄운 빈 줄을 살리기 위함.
+        blocks.append(('p', dict(shape=p.get('paraPrIDRef'), runs=runs)))
+    return blocks
+
+
+def _hwpx_table(tbl):
+    """<hp:tbl> -> ('tbl', 표정보, 셀목록)"""
+    if True:
         cells = []
         for tc in tbl.iter():
             if _q(tc.tag) != 'tc':
@@ -345,10 +371,10 @@ def parse_hwpx_section(root, warn):
                     (sub.get('vertAlign') or '').upper() if sub is not None else '', 1),
                 paras=paras))
 
-        if cells:
-            tables.append((dict(rows=int(tbl.get('rowCnt') or 0),
-                                cols=int(tbl.get('colCnt') or 0)), cells))
-    return tables
+        if not cells:
+            return None
+        return ('tbl', dict(rows=int(tbl.get('rowCnt') or 0),
+                            cols=int(tbl.get('colCnt') or 0)), cells)
 
 
 def read_hwpx(path, warn):
@@ -363,21 +389,49 @@ def read_hwpx(path, warn):
 
         secs = sorted(n for n in names
                       if re.match(r'Contents/section\d+\.xml$', n, re.I))
-        tables = []
+        blocks, page = [], None
         for s in secs:
             root = ET.fromstring(z.read(s))
+            if page is None:
+                page = _hwpx_page(root)
             n_shape = sum(1 for e in root.iter()
                           if _q(e.tag) in ('rect', 'ellipse', 'polygon', 'pic', 'container'))
             if n_shape:
                 warn.append('그리기개체/글상자 %d개 감지 - 개체 안의 표는 누락될 수 있음'
                             % n_shape)
-            tables.extend(parse_hwpx_section(root, warn))
-    return bfs, css, pss, tables
+            blocks.extend(parse_hwpx_section(root, warn))
+    return bfs, css, pss, blocks, page
+
+
+def _hwpx_page(root):
+    """용지 크기와 여백(HWPUNIT) -> (짧은변, 긴변, 세로여백합, 가로여백합)"""
+    pp = _find(root, 'pagePr')
+    if pp is None:
+        return None
+    w = int(pp.get('width') or 0)
+    h = int(pp.get('height') or 0)
+    mv = mh = 0
+    mg = _find(root, 'margin')
+    if mg is not None:
+        mv = sum(int(mg.get(k) or 0) for k in ('top', 'bottom', 'header', 'footer'))
+        mh = sum(int(mg.get(k) or 0) for k in ('left', 'right', 'gutter'))
+    return (min(w, h), max(w, h), mv, mh) if w and h else None
 
 
 # ------------------------- 문단 텍스트 -------------------------
 # 1 WCHAR 를 차지하는 제어문자 (나머지 제어문자는 8 WCHAR)
 _CH1 = {0, 10, 13, 24, 25, 26, 27, 28, 29, 30, 31}
+
+
+def _has_object(data):
+    """문단이 표·그림 같은 개체를 담고 있나 (8 WCHAR 짜리 제어문자 존재)"""
+    i, n = 0, len(data) // 2
+    while i < n:
+        c = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+        if c < 32 and c not in _CH1:
+            return True
+        i += 1
+    return False
 
 
 def para_text(data):
@@ -405,16 +459,49 @@ def para_text(data):
 
 
 # --------------------------- Section ---------------------------
+def _hwp_page(recs):
+    """HWPTAG_PAGE_DEF(73) -> (짧은변, 긴변, 세로여백합, 가로여백합)"""
+    for tag, lvl, d in recs:
+        if tag == 73 and len(d) >= 36:
+            w, h, ml, mr, mt, mb, mh, mf, mg = struct.unpack('<9I', d[0:36])
+            return min(w, h), max(w, h), mt + mb + mh + mf, ml + mr + mg
+    return None
+
+
 def parse_tables(buf, warn):
-    """섹션 안의 모든 표를 파싱해서 [(정보, 셀목록), ...] 반환"""
+    """섹션 -> 문서 순서대로 블록 목록
+
+    ('tbl', 정보, 셀목록) 또는 ('p', 문단)
+    표 바깥 문단도 담는다. 예전에는 표만 옮기고 바깥 글을 조용히 버렸다.
+    """
     recs = list(_records(buf))
-    tables = []
+    blocks = []
 
     n_shape = sum(1 for t, l, d in recs if t == 76)
     if n_shape:
         warn.append('그리기개체/글상자 %d개 감지 - 개체 안의 표는 누락될 수 있음' % n_shape)
 
     for ti, (tag, tlvl, d) in enumerate(recs):
+        # 표 바깥(최상위) 문단. 빈 줄은 PARA_TEXT 레코드 자체가 없으므로
+        # 문단 헤더(66)를 기준으로 잡아야 엔터로 띄운 줄이 살아남는다.
+        if tag == 66 and tlvl <= 1 and len(d) >= 10:
+            sh = struct.unpack('<H', d[8:10])[0]
+            txt, cs, obj = '', 0, False
+            for t2, l2, d2 in recs[ti + 1:]:
+                if t2 == 66:                    # 다음 문단 시작
+                    break
+                if t2 == 67:
+                    # 표·그림을 담은 문단은 글자가 개체를 가리키는 제어문자뿐
+                    # 이라 para_text 가 빈다. 이걸 빈 줄로 오해하면 표 위아래에
+                    # 엉뚱한 빈 행이 생긴다.
+                    obj = _has_object(d2)
+                    txt = para_text(d2)[0]
+                elif t2 == 68 and len(d2) >= 8 and not cs:
+                    cs = struct.unpack('<II', d2[0:8])[1]
+            if not obj:
+                blocks.append(('p', dict(shape=sh,
+                                         runs=[(cs, txt)] if txt else [])))
+            continue
         if tag != 77 or len(d) < 8:
             continue
         nrows, ncols = struct.unpack('<HH', d[4:8])
@@ -456,8 +543,8 @@ def parse_tables(buf, warn):
             for c in cells:                       # HWPX 와 같은 형태로 정규화
                 c['paras'] = [dict(shape=p['shape'], runs=_resolve_runs(p))
                               for p in c['paras']]
-            tables.append((dict(rows=nrows, cols=ncols), cells))
-    return tables
+            blocks.append(('tbl', dict(rows=nrows, cols=ncols), cells))
+    return blocks
 
 
 def _resolve_runs(p):
@@ -530,19 +617,100 @@ def _cell_props(bf, align, valign):
     return p
 
 
-def write_table(wb, ws, cells, bfs, css, pss, cache):
-    colw, rowh, spans = {}, {}, []
+def _col_widths(cells):
+    """셀 목록 -> {열번호: 너비(HWPUNIT)}"""
+    colw, spans = {}, []
+    for c in cells:
+        if c['cspan'] == 1:
+            colw[c['col']] = max(colw.get(c['col'], 0), c['w'])
+        else:
+            spans.append((c['col'], c['cspan'], c['w']))
+    # 어떤 열은 그 열을 홑겹으로 쓰는 셀이 하나도 없어서(전부 병합 셀에만
+    # 걸쳐 있어서) 너비를 못 정한다. 그대로 두면 엑셀 기본값(8.43)이 되어
+    # 그 열만 두 배로 벌어진다. 병합 셀 너비에서 이미 아는 열을 빼고 남은
+    # 폭을 모르는 열끼리 나눠 갖게 한다. 좁은 span 부터 처리해야 미지 열이
+    # 하나만 남는 경우가 많아 정확해진다.
+    for c0, cspan, w in sorted(spans, key=lambda x: x[1]):
+        cols = range(c0, c0 + cspan)
+        unknown = [i for i in cols if i not in colw]
+        if not unknown:
+            continue
+        rest = w - sum(colw.get(i, 0) for i in cols if i in colw)
+        each = max(1, rest // len(unknown))
+        for i in unknown:
+            colw[i] = each
+    return colw
+
+
+def _row_heights(cells):
+    """셀 목록 -> {행번호: 높이(pt)}
+
+    한 행만 쓰는 셀이 그 행의 정확한 높이다. 여러 행에 걸친 셀은 걸친 행들의
+    합이므로, 아직 모르는 행이 남았을 때만 나머지를 나눠서 채운다. 걸친 셀
+    높이를 행마다 max 로 넣으면 실제보다 부풀려져 장수 판정이 틀어진다.
+    """
+    known, spans = {}, []
+    for c in cells:
+        if c['rspan'] == 1:
+            known[c['row']] = max(known.get(c['row'], 0), c['h'] / 100.0)
+        else:
+            spans.append((c['row'], c['rspan'], c['h'] / 100.0))
+    for r0, rs, h in sorted(spans, key=lambda x: x[1]):
+        rows = range(r0, r0 + rs)
+        unknown = [i for i in rows if i not in known]
+        if not unknown:
+            continue
+        rest = h - sum(known.get(i, 0) for i in rows if i in known)
+        each = max(1.0, rest / len(unknown))
+        for i in unknown:
+            known[i] = each
+    return known
+
+
+def _edges(colw):
+    """{열번호: 너비} -> 누적 경계 [0, w0, w0+w1, ...]"""
+    e = [0]
+    for i in range(max(colw) + 1 if colw else 0):
+        e.append(e[-1] + colw.get(i, 0))
+    return e
+
+
+def _snap(edges, x):
+    """x(HWPUNIT)에 가장 가까운 격자 경계의 인덱스"""
+    return min(range(len(edges)), key=lambda i: abs(edges[i] - x))
+
+
+# 엑셀이 한 줄에 쓰는 높이는 글자 크기의 1.36~1.50배다(Calibri 1.36,
+# 굴림 1.43, 맑은 고딕 1.50). 한/글 전용 글꼴이 없는 PC 에서는 맑은 고딕
+# 같은 글꼴로 대체되므로 가장 큰 값을 기준으로 잡아야 잘리지 않는다.
+_LINE = 1.5
+
+
+def _need_pt(text, sz, px):
+    """줄바꿈과 자동 줄나눔을 고려한 필요 높이(pt)"""
+    lines = 0
+    for seg in text.split('\n'):
+        w = sum(2.0 if ord(ch) > 0x1100 else 1.0 for ch in seg) * sz * 0.55
+        lines += max(1, int(w // px) + (1 if w % px else 0))
+    return lines * sz * _LINE + 2.0
+
+
+def write_cells(wb, ws, cells, bfs, css, pss, cache, grid, r_off, need):
+    """셀 목록을 격자(grid)에 맞춰 r_off 행부터 기록. 행별 필요 높이를 need 에 채움"""
+    own = _edges(_col_widths(cells))
+    scale = (grid[-1] / own[-1]) if own[-1] else 1.0
+    same = len(own) == len(grid)
 
     for c in cells:
-        r0, c0 = c['row'], c['col']            # xlsxwriter 는 0부터
-        bf = bfs.get(c['bf'])
+        r0 = c['row'] + r_off
+        if same:
+            c0, c1 = c['col'], c['col'] + c['cspan'] - 1
+        else:                                   # 열 구조가 다른 표 -> 격자에 스냅
+            c0 = _snap(grid, own[c['col']] * scale)
+            c1 = _snap(grid, own[min(c['col'] + c['cspan'], len(own) - 1)] * scale) - 1
+            c1 = max(c0, c1)
 
-        if c['cspan'] == 1:
-            colw[c0] = max(colw.get(c0, 0), c['w'])
-        else:
-            spans.append((c0, c['cspan'], c['w']))
-        if c['rspan'] == 1:
-            rowh[r0] = max(rowh.get(r0, 0), c['h'])
+        bf = bfs.get(c['bf'])
 
         # --- 텍스트 조립 ---
         # 문단 사이 줄바꿈은 "\n 하나만 있는 런"으로 만들지 않는다.
@@ -569,14 +737,21 @@ def write_table(wb, ws, cells, bfs, css, pss, cache):
         base = _cell_props(bf, align, c['valign'])
         mixed = len({_fkey(cs) for cs, _ in segs}) > 1
 
-        # 서식이 하나뿐이면 그 글꼴을 셀 서식에 합친다.
-        # 섞였으면 셀 서식의 글꼴은 건드리지 않고(중립) 런별로 지정한다.
-        if segs and not mixed and segs[0][0]:
-            base.update(_font_props(segs[0][0]))
+        # 셀 자체의 글꼴. 서식이 섞였어도 글꼴 이름과 크기는 반드시 넣는다.
+        # 안 넣으면 엑셀 기본값(Calibri 11pt)이 되어, 5pt 짜리 내용인데도
+        # 11pt 기준으로 줄 간격과 행 높이를 계산해 위아래가 크게 벌어진다.
+        # 색·취소선·밑줄만 빼서 중립으로 둔다(리치 런이 각자 지정하므로).
+        if segs and segs[0][0]:
+            f = _font_props(segs[0][0])
+            if mixed:
+                f.pop('font_color', None)
+                f.pop('font_strikeout', None)
+                f.pop('underline', None)
+            base.update(f)
         cell_fmt = _fmt(wb, cache, base)
 
-        r1, c1 = r0 + c['rspan'] - 1, c0 + c['cspan'] - 1
-        merged = c['rspan'] > 1 or c['cspan'] > 1
+        r1 = r0 + c['rspan'] - 1
+        merged = c['rspan'] > 1 or c1 > c0
         if merged:
             ws.merge_range(r0, c0, r1, c1, '', cell_fmt)
 
@@ -593,34 +768,146 @@ def write_table(wb, ws, cells, bfs, css, pss, cache):
         else:
             ws.write_string(r0, c0, text, cell_fmt)
 
-    # 어떤 열은 그 열을 홑겹으로 쓰는 셀이 하나도 없어서(전부 병합 셀에만
-    # 걸쳐 있어서) 위에서 너비를 못 정한다. 그대로 두면 엑셀 기본값(8.43)이
-    # 되어 그 열만 두 배로 벌어진다. 병합 셀 너비에서 이미 아는 열을 빼고
-    # 남은 폭을 모르는 열끼리 나눠 갖게 한다. 좁은 span 부터 처리해야
-    # 미지 열이 하나만 남는 경우가 많아 정확해진다.
-    for c0, cspan, w in sorted(spans, key=lambda x: x[1]):
-        cols = range(c0, c0 + cspan)
-        unknown = [i for i in cols if i not in colw]
-        if not unknown:
-            continue
-        rest = w - sum(colw.get(i, 0) for i in cols if i in colw)
-        each = max(1, rest // len(unknown))
-        for i in unknown:
-            colw[i] = each
+        # 이 셀이 요구하는 행 높이. 한글은 줄 간격을 글자 크기와 비슷하게
+        # 잡지만 엑셀은 약 1.22배를 쓰므로, 원본 높이 그대로 두면 잘린다.
+        # 여러 행에 걸친 셀은 필요한 높이를 걸친 행들이 나눠 갖는다. 예전에는
+        # 이런 셀을 건너뛰어서 병합된 행만 최소 높이로 남아 글자가 잘렸다.
+        if text.strip():
+            sz = max([s['size'] for s, _ in segs if s] or [10.0])
+            px = max(8.0, (grid[min(c1 + 1, len(grid) - 1)] - grid[c0])
+                     / 7200.0 * 96.0 - 6)
+            share = _need_pt(text, sz, px) / c['rspan']
+            for k in range(c['rspan']):
+                need[r0 + k] = max(need.get(r0 + k, 0), share)
+        for k in range(c['rspan']):
+            need.setdefault(r0 + k, 0)
 
-    # HWPUNIT = 1/7200 inch
-    for ci, w in colw.items():
-        px = w / 7200.0 * 96.0                              # 96dpi 픽셀
-        # 엑셀이 파일에 저장하는 열너비 = (픽셀 - 5) / 7.
-        # xlsxwriter 는 넘긴 값에 5/7 을 더해서 저장하므로 미리 빼둔다.
-        stored = max(1.0, (px - 5) / 7.0)
-        ws.set_column(ci, ci, stored - 5.0 / 7.0)
-    for ri, h in rowh.items():
-        ws.set_row(ri, max(9.0, h / 100.0))                 # HWPUNIT/100 = pt
+
+def _page_h(blocks, page):
+    """이 블록들을 인쇄할 때 한 장에 쓸 수 있는 높이(pt). 용지 방향까지 판단."""
+    if not page:
+        return None
+    tables = [b for b in blocks if b[0] == 'tbl']
+    if not tables:
+        return None
+    grid = _edges(_col_widths(tables[0][2]))
+    short, long_, mv, mh = page
+    land = grid[-1] > (short - mh)
+    return ((short if land else long_) - mv) / 100.0
+
+
+def plan_sheets(blocks, page):
+    """블록 -> 시트별 블록 목록
+
+    원본이 한 장짜리면 표와 표 바깥 글을 한 시트에 이어 붙인다. 원본이 두 장
+    이상이면 표마다 시트를 나눈다(표1, 표2...). 여러 장짜리를 한 시트에 이어
+    붙이면 줄 간격이 늘어난 만큼 장수가 더 늘어나고, 장수를 맞추려면 그만큼
+    축소해야 해서 글자가 작아진다. 시트를 나누면 축소 없이 원본 장수가 나온다.
+    """
+    tables = [b for b in blocks if b[0] == 'tbl']
+    ph = _page_h(blocks, page)
+    if len(tables) <= 1 or not ph:
+        return [blocks]
+
+    total = sum(sum(_row_heights(b[2]).values()) for b in tables)
+    total += sum(9.0 for b in blocks if b[0] == 'p')
+    if total <= ph:
+        return [blocks]
+
+    groups, cur = [], []
+    for b in blocks:
+        if b[0] == 'tbl' and cur:
+            groups.append(cur)
+            cur = []
+        cur.append(b)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def write_blocks(wb, ws, blocks, bfs, css, pss, cache, page):
+    """표와 표 바깥 글을 한 시트에 위에서부터 이어 붙인다.
+
+    엑셀은 열 너비가 시트 전체에 공통이라, 열 구조가 다른 표를 아래에 두려면
+    첫 표의 열 격자에 스냅해서 병합으로 흉내내야 한다. 시트를 나누면 인쇄를
+    여러 번 해야 해서 "한 장에" 요구와 어긋난다.
+    """
+    tables = [b for b in blocks if b[0] == 'tbl']
+    grid = _edges(_col_widths(tables[0][2]))            # 첫 표 = 기준 격자
+    ncols = max(1, len(grid) - 1)
+
+    # HWPUNIT = 1/7200 inch. 엑셀 저장 열너비 = (픽셀 - 5) / 7.
+    # xlsxwriter 는 넘긴 값에 5/7 을 더해서 저장하므로 미리 빼둔다.
+    for i in range(ncols):
+        px = (grid[i + 1] - grid[i]) / 7200.0 * 96.0
+        ws.set_column(i, i, max(1.0, (px - 5) / 7.0) - 5.0 / 7.0)
+
+    rowh, need, r_off = {}, {}, 0
+    for b in blocks:
+        if b[0] == 'tbl':
+            cells = b[2]
+            for r, h in _row_heights(cells).items():
+                rowh[r + r_off] = max(rowh.get(r + r_off, 0), h)
+            write_cells(wb, ws, cells, bfs, css, pss, cache, grid, r_off, need)
+            r_off += max(c['row'] + c['rspan'] for c in cells)
+        else:                                            # 표 바깥 글 한 줄
+            p = b[1]
+            segs = [(css.get(cid), t) for cid, t in p['runs'] if t]
+            text = ''.join(t for _, t in segs)
+            base = _cell_props(None, pss.get(p['shape']), 0)
+            mixed = len({_fkey(s) for s, _ in segs}) > 1
+            if segs and segs[0][0]:
+                f = _font_props(segs[0][0])
+                if mixed:
+                    f.pop('font_color', None)
+                    f.pop('font_strikeout', None)
+                    f.pop('underline', None)
+                base.update(f)
+            fmt = _fmt(wb, cache, base)
+            ws.merge_range(r_off, 0, r_off, ncols - 1, '', fmt)
+            if mixed:
+                frags = []
+                for cs, t in segs:
+                    frags.append(_fmt(wb, cache, _font_props(cs)) if cs else None)
+                    frags.append(t)
+                ws.write_rich_string(r_off, 0, *[x for x in frags if x is not None], fmt)
+            else:
+                ws.write_string(r_off, 0, text, fmt)
+            sz = max([s['size'] for s, _ in segs if s] or [10.0])
+            need[r_off] = _need_pt(text, sz, max(8.0, grid[-1] / 7200.0 * 96.0 - 6))
+            r_off += 1
+
+    total = 0
+    for r in range(r_off):
+        h = max(rowh.get(r, 0), need.get(r, 0), 9.0)
+        ws.set_row(r, h)
+        total += h
 
     ws.hide_gridlines(2)
-    ws.set_landscape()
-    ws.fit_to_pages(1, 0)
+
+    # 용지 방향은 속성 이름(NARROWLY/WIDELY)이 포맷마다 헷갈려서, 표 폭이
+    # 세로 용지에 들어가는지로 판단한다. 들어가면 세로, 넘치면 가로.
+    land, ph = True, None
+    if page:
+        short, long_, mv, mh = page
+        land = grid[-1] > (short - mh)
+        ph = ((short if land else long_) - mv) / 100.0
+        # 여백도 원본을 따라간다. 엑셀 기본 여백(상하 0.75인치)은 한글 기본
+        # (3mm)보다 훨씬 커서, 그대로 두면 원본에서 한 장이던 표가 넘친다.
+        inch = mv / 2.0 / 7200.0
+        ws.set_margins(left=mh / 2.0 / 7200.0, right=mh / 2.0 / 7200.0,
+                       top=inch, bottom=inch)
+    ws.set_landscape() if land else ws.set_portrait()
+
+    # 원본이 몇 장이었는지 세어서 그 장수에 맞춘다. 무조건 한 장으로 맞추면
+    # 원래 두 장짜리가 절반 크기로 찌그러지고, 반대로 안 맞추면 줄 간격이
+    # 늘어난 만큼 장수가 늘어난다(두 장짜리가 세 장이 되는 식).
+    if not ph:
+        ws.fit_to_pages(1, 0)
+        return 0
+    pages = max(1, int(-(-sum(rowh.values()) // ph)))
+    ws.fit_to_pages(1, pages)
+    return pages
 
 
 # --------------------------- 변환 1건 ---------------------------
@@ -645,12 +932,15 @@ def read_hwp5(src, warn):
         bfs, css, pss = parse_docinfo(raw('DocInfo'))
         sections = sorted(s for s in ('/'.join(x) for x in ole.listdir())
                           if s.startswith('BodyText/Section'))
-        tables = []
+        blocks, page = [], None
         for s in sections:
-            tables.extend(parse_tables(raw(s), warn))
+            recs_buf = raw(s)
+            if page is None:
+                page = _hwp_page(list(_records(recs_buf)))
+            blocks.extend(parse_tables(recs_buf, warn))
     finally:
         ole.close()
-    return bfs, css, pss, tables
+    return bfs, css, pss, blocks, page
 
 
 def convert(src, dst):
@@ -660,31 +950,47 @@ def convert(src, dst):
 
     # 확장자가 아니라 실제 내용으로 판별한다 (확장자만 바꿔둔 파일 대비).
     if magic[:4] == b'PK\x03\x04':                        # ZIP -> HWPX
-        bfs, css, pss, tables = read_hwpx(src, warn)
+        bfs, css, pss, blocks, page = read_hwpx(src, warn)
     elif magic == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':    # OLE -> HWP 5.0
-        bfs, css, pss, tables = read_hwp5(src, warn)
+        bfs, css, pss, blocks, page = read_hwp5(src, warn)
     else:
         raise ValueError('한글 문서가 아님 (.hwp/.hwpx 둘 다 아님)')
 
+    # 표 앞뒤로 남는 빈 줄은 원본에서도 의미 없는 여백이라 잘라낸다.
+    def _empty(b):
+        return b[0] == 'p' and not any(t.strip() for _, t in b[1]['runs'])
+    while blocks and _empty(blocks[0]):
+        blocks.pop(0)
+    while blocks and _empty(blocks[-1]):
+        blocks.pop()
+
+    tables = [b for b in blocks if b[0] == 'tbl']
+    texts = [b for b in blocks if b[0] == 'p' and not _empty(b)]
     if not tables:
         raise ValueError('표를 찾지 못함')
-    if len(tables) > 1:
-        warn.append('표가 %d개 - 시트를 나눠서 저장함' % len(tables))
+
+    groups = plan_sheets(blocks, page)
+    if len(groups) > 1:
+        warn.append('표가 %d개 - 시트를 나눠서 저장함(표1, 표2...)' % len(tables))
+    elif len(tables) > 1:
+        warn.append('표가 %d개 - 한 시트에 이어 붙임' % len(tables))
+    if texts:
+        warn.append('표 바깥 글 %d줄을 표 아래에 붙임' % len(texts))
 
     wb = xlsxwriter.Workbook(dst, {'strings_to_numbers': False,
                                    'strings_to_formulas': False,
                                    'strings_to_urls': False})
     try:
-        cache = {}
-        for i, (info, cells) in enumerate(tables, 1):
-            ws = wb.add_worksheet('표%d' % i if len(tables) > 1 else '표')
-            write_table(wb, ws, cells, bfs, css, pss, cache)
+        pages = 0
+        for i, g in enumerate(groups, 1):
+            ws = wb.add_worksheet('표%d' % i if len(groups) > 1 else '표')
+            pages += write_blocks(wb, ws, g, bfs, css, pss, {}, page)
     finally:
         wb.close()
 
-    info = tables[0][0]
-    return dict(rows=info['rows'], cols=info['cols'],
-                cells=len(tables[0][1]), tables=len(tables), warn=warn)
+    info = tables[0][1]
+    return dict(rows=info['rows'], cols=info['cols'], cells=len(tables[0][2]),
+                tables=len(tables), pages=pages, warn=warn)
 
 
 # ----------------------------- 배치 -----------------------------
